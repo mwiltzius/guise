@@ -9,22 +9,22 @@ class Guise < Formula
   desc "Present files in a different guise, with personal information swapped out"
   homepage "https://github.com/mwiltzius/guise"
   url "https://github.com/mwiltzius/guise/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
+  sha256 "44d9236305665c27cd76c064b3e519e214f75e09d6d065c10c6c80d2e5cb7667"
   license "GPL-3.0-only"
   head "https://github.com/mwiltzius/guise.git", branch: "main"
 
   depends_on "go" => :build
 
   def install
-    ldflags = "-s -w -X main.version=#{version}"
+    ldflags = "-X main.version=#{version}" # std_go_args adds -s -w
     system "go", "build", *std_go_args(ldflags: ldflags), "./cmd/guise"
   end
 
   def caveats
     on_linux do
       <<~EOS
-        guise mounts guises with FUSE. Install your distribution's fuse3
-        package (it provides the setuid fusermount3 helper), e.g.:
+        guise mounts guises with FUSE, which needs your distribution's fuse3
+        package (it lets guise mount without root), e.g.:
           sudo apt install fuse3
       EOS
     end
