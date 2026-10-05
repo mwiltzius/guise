@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -49,6 +50,12 @@ func Start(fsys billy.Filesystem, mountpoint string) (*Server, error) {
 		return nil, fmt.Errorf("mounting is not supported on %s yet", runtime.GOOS)
 	}
 	nfs.Log.SetLevel(nfs.ErrorLevel)
+	if os.Getenv("GUISE_DEBUG") != "" { // log every request and failure, for diagnosing clients
+		nfs.Log.SetLevel(nfs.TraceLevel)
+		if c, ok := fsys.(changeFS); ok {
+			fsys = debugFS{c}
+		}
+	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -62,7 +69,10 @@ func Start(fsys billy.Filesystem, mountpoint string) (*Server, error) {
 	port := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
 	opts := strings.Join([]string{
 		"port=" + port, "mountport=" + port, "vers=3", "tcp",
-		"nolocks", "locallocks", "noresvport", // no lockd/statd; unprivileged client port
+		// Locks are handled by this Mac's client (no lockd/statd needed).
+		// Not "nolocks": that makes every lock fail, and apps like Word then
+		// open documents read-only.
+		"locallocks", "noresvport", // noresvport: unprivileged client port
 		// Soft: fail rather than hang if we die (a dead server is noticed at
 		// once anyway: the connection is refused). 3 s per try leaves ample
 		// room for slow requests without "not responding" messages.

@@ -10,7 +10,7 @@ PLAN*.md
 # Vaults and real data — never commit these
 *.age
 /.vault/
-/.pi/
+/.guise/
 
 # Build output
 /bin/
@@ -26,5 +26,3 @@ coverage.*
 *.swp
 *~
 
-# Local manual-testing area
-/tests/

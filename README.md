@@ -47,7 +47,8 @@ That's it. There is no mount step: `guise new` starts the background process if 
 - **Spellings**: `{{pi.lastname:upper}}`, `{{pi.lastname:lower}}`, and numbered variants such as `{{pi.lastname:2}}` for any other casing, which are recorded automatically.
 - **Several values of one kind**: `{{pi.lastname.2}}`. Names can be grouped however you like, e.g. `ref1.phone`.
 - **Detection**: emails, phone numbers, SSNs and card numbers that aren't in your vault are hidden anyway, as `{{pi.unreviewed.email.1}}`. Run `guise review` to name them or dismiss them.
-- **Directories**: `guise new ~/Documents/job ~/ai/job` guises every text file inside. Binary files, symlinks and vaults are never exposed. Files deleted through a directory guise go to the Trash.
+- **Directories**: `guise new ~/Documents/job ~/ai/job` guises every text file and Word document inside. Other binary files, symlinks and vaults are never exposed. Files deleted through a directory guise go to the Trash.
+- **Word documents** (`.docx`, `.docm`, `.dotx`, `.dotm`): body text, headers and footers, footnotes, comments, tracked changes, authors, document properties, image alt text and hyperlinks are all transformed. Word often splits a word across several formatting runs; guise handles that. As a final check, a document is withheld from the guise entirely if any vault value would remain anywhere in it.
 - **Fill mode**: `guise new --fill letter.md ~/out/alice.md --vault alice.toml` works the other way round. The original holds placeholders and the guise shows one person's values, so you can have one letter with many personalized guises.
 
 ### Vaults and rules
@@ -92,7 +93,17 @@ guise status | unlock | start | stop | autostart [on|off]
 
 A guise keeps your values out of what an AI *reads through the guise*. It doesn't stop a program that can read your whole disk from opening the original, the vault, or the mount's real data source. Run AI agents with access limited to their working directory, which is a setting most agents offer. Vaults are encrypted by default, and passphrases only ever travel over pipes or a private socket, never in command lines or environment variables.
 
-Known limitations: guises are text-only for now (`.docx` support is planned), and some tools replace a file guise's symlink instead of writing through it (e.g. GNU `sed -i`). `guise` notices within two seconds, applies the edit and restores the link.
+Known limitations: plain text and Word documents only for now (other formats are hidden in hide mode). Some tools replace a file guise's symlink instead of writing through it (e.g. GNU `sed -i`); `guise` notices within two seconds, applies the edit and restores the link. On macOS, `cp` into a guise may report that it couldn't copy extended attributes after the folder was listed; the file's contents are copied correctly.
+
+## Tests
+
+```bash
+tests/run.sh          # everything
+tests/run.sh unit     # Go unit tests (they live next to the code)
+tests/run.sh e2e      # end-to-end tests over real mounts, in a throwaway HOME
+```
+
+The end-to-end tests need `python3`, and on Linux also `fuse3` (plus `vim` for the vim checks). Set `GUISE_DEBUG=1` to log every NFS request and failing filesystem operation to the background process's log.
 
 ## License
 

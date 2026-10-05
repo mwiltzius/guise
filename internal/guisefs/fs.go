@@ -22,11 +22,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/mwiltzius/guise/internal/docx"
 	"github.com/mwiltzius/guise/internal/registry"
 	"github.com/mwiltzius/guise/internal/rules"
 	"github.com/mwiltzius/guise/internal/transform"
@@ -352,6 +354,38 @@ func (f *FS) inverse(g *guiseState, e *transform.Engine, s, name string) string 
 	return out
 }
 
+// forwardDocx and inverseDocx convert Word documents. In hide mode the
+// result is checked for any hidden value left in parts the converter does
+// not handle; if one is found the document is not shown at all.
+func (f *FS) forwardDocx(g *guiseState, e *transform.Engine, raw []byte) ([]byte, error) {
+	opt := docx.Options{Edit: func(s string) []transform.Edit { ed, _ := e.FillEdits(s); return ed }}
+	if g.hide() {
+		opt = docx.Options{Edit: e.HideEdits, Leaks: e.Leaks}
+	}
+	out, err := docx.Transform(raw, opt)
+	if g.hide() && g.stack.Dirty() {
+		f.dirty[g.stack] = true
+		f.scheduleSaveLocked()
+	}
+	return out, err
+}
+
+func (f *FS) inverseDocx(g *guiseState, e *transform.Engine, data []byte, name string) ([]byte, error) {
+	if !g.hide() {
+		return docx.Transform(data, docx.Options{Edit: e.UnfillEdits})
+	}
+	var unknown []string
+	out, err := docx.Transform(data, docx.Options{Edit: func(s string) []transform.Edit {
+		ed, rep := e.RevealEdits(s)
+		unknown = append(unknown, rep.Unknown...)
+		return ed
+	}})
+	if len(unknown) > 0 {
+		f.opt.Logf("%s: unknown placeholders written verbatim: %v", name, unknown)
+	}
+	return out, err
+}
+
 func (f *FS) scheduleSaveLocked() {
 	if f.saveTimer != nil {
 		return
@@ -452,12 +486,33 @@ type node struct {
 
 var errHidden = fs.ErrNotExist
 
+// sandboxStaging matches the folders macOS creates next to a document so a
+// sandboxed app (e.g. Word) can stage a save: "cv.docx.sb-d4785637-AgmyQ4".
+var sandboxStaging = regexp.MustCompile(`\.sb-[0-9a-f]{8}-[A-Za-z0-9]{6}$`)
+
+// isScratchPath reports whether a guise-relative path belongs in scratch
+// storage: any component with a scratch name puts its whole subtree there.
+func isScratchPath(rel string) bool {
+	for _, part := range strings.Split(rel, "/") {
+		if isScratchName(part) {
+			return true
+		}
+	}
+	return false
+}
+
 // isScratchName reports whether a file name belongs in scratch storage:
-// macOS metadata and editor swap/backup files.
+// macOS metadata and sandbox staging folders, editor swap/backup files, and
+// office lock/temp files.
 func isScratchName(name string) bool {
 	switch {
+	case sandboxStaging.MatchString(name):
+		return true
 	case strings.HasPrefix(name, "._"), name == ".DS_Store", name == "4913",
 		strings.HasSuffix(name, "~"),
+		// Word and LibreOffice lock and temp files.
+		strings.HasPrefix(name, "~$"), strings.HasPrefix(name, "~WRL"), strings.HasPrefix(name, "~WRD"),
+		strings.HasPrefix(name, ".~WR"), strings.HasPrefix(name, ".~lock."), strings.HasPrefix(name, "Word Work File"),
 		strings.HasPrefix(name, ".") && (strings.HasSuffix(name, ".swp") ||
 			strings.HasSuffix(name, ".swo") || strings.HasSuffix(name, ".swx")):
 		return true
@@ -483,7 +538,7 @@ func (f *FS) resolveLocked(p string) (node, error) {
 	}
 	scratch := node{kind: nScratch, g: g, rel: rel,
 		real: filepath.Join(f.opt.ScratchDir, g.rec.ID, filepath.FromSlash(rel))}
-	if isScratchName(path.Base(rel)) {
+	if isScratchPath(rel) {
 		return scratch, nil
 	}
 	if g.rec.Kind == registry.KindFile {

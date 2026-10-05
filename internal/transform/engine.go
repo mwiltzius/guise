@@ -126,11 +126,39 @@ func (e *Engine) Unreviewed() *Unreviewed { return e.unreviewed }
 // Variants returns the engine's recorded spellings.
 func (e *Engine) Variants() *Variants { return e.variants }
 
+// Edit replaces text[Start:End] with Text. Edits returned by the engine
+// are sorted and never overlap. Callers that keep text in pieces (e.g. a
+// Word document's runs) use them to map changes back onto the pieces.
+type Edit struct {
+	Start, End int
+	Text       string
+}
+
+// Apply returns text with edits applied.
+func Apply(text string, edits []Edit) string {
+	if len(edits) == 0 {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	pos := 0
+	for _, ed := range edits {
+		b.WriteString(text[pos:ed.Start])
+		b.WriteString(ed.Text)
+		pos = ed.End
+	}
+	b.WriteString(text[pos:])
+	return b.String()
+}
+
 // Hide converts original text to its guise: vault values become named
 // placeholders (irregular spellings are recorded as variants), detector
 // matches become unreviewed placeholders, and literal placeholder-like text
 // is escaped. Reveal(Hide(t)) == t for any t.
-func (e *Engine) Hide(text string) string {
+func (e *Engine) Hide(text string) string { return Apply(text, e.HideEdits(text)) }
+
+// HideEdits returns the edits Hide makes.
+func (e *Engine) HideEdits(text string) []Edit {
 	reserved := e.syntax.triggers(text)
 	var cands []match
 	for _, m := range e.matchers {
@@ -146,59 +174,54 @@ func (e *Engine) Hide(text string) string {
 	}
 	sel := selectMatches(len(text), cands, reserved)
 
-	var b strings.Builder
-	b.Grow(len(text))
-	pos, ti := 0, 0
-	literal := func(end int) { // copy text[pos:end], escaping triggers
-		for ti < len(reserved) && reserved[ti].end <= end {
-			r := reserved[ti]
-			b.WriteString(text[pos:r.start])
-			b.WriteString(e.syntax.escape(text[r.start:r.end]))
-			pos = r.end
-			ti++
-		}
-		b.WriteString(text[pos:end])
-		pos = end
+	// Matches never overlap escape triggers, so the two lists merge cleanly.
+	edits := make([]Edit, 0, len(sel)+len(reserved))
+	for _, r := range reserved {
+		edits = append(edits, Edit{r.start, r.end, e.syntax.escape(text[r.start:r.end])})
 	}
 	for _, m := range sel {
-		literal(m.start)
 		got := text[m.start:m.end]
+		var ph string
 		switch {
 		case m.name == "":
-			b.WriteString(e.syntax.Placeholder(e.unreviewed.assign(m.kind, got), ModNone))
+			ph = e.syntax.Placeholder(e.unreviewed.assign(m.kind, got), ModNone)
 		case m.irregular:
-			b.WriteString(e.syntax.Placeholder(m.name, strconv.Itoa(e.variants.assign(m.name, got))))
+			ph = e.syntax.Placeholder(m.name, strconv.Itoa(e.variants.assign(m.name, got)))
 		default:
-			b.WriteString(e.syntax.Placeholder(m.name, m.mod))
+			ph = e.syntax.Placeholder(m.name, m.mod)
 		}
-		pos = m.end
+		edits = append(edits, Edit{m.start, m.end, ph})
 	}
-	literal(len(text))
-	return b.String()
+	sort.Slice(edits, func(i, j int) bool { return edits[i].Start < edits[j].Start })
+	return edits
 }
 
 // Reveal converts a guise back to original text: placeholders are rendered
 // and escapes removed. Unknown placeholders are kept verbatim and reported.
 func (e *Engine) Reveal(text string) (string, Report) {
-	var b strings.Builder
+	edits, rep := e.RevealEdits(text)
+	return Apply(text, edits), rep
+}
+
+// RevealEdits returns the edits Reveal makes.
+func (e *Engine) RevealEdits(text string) ([]Edit, Report) {
+	var edits []Edit
 	var rep Report
+	off := 0
 	for _, t := range e.syntax.scan(text) {
 		switch t.kind {
-		case tokText:
-			b.WriteString(t.text)
 		case tokEscape:
-			b.WriteString(t.lit)
+			edits = append(edits, Edit{off, off + len(t.text), t.lit})
 		case tokPlaceholder:
-			v, ok := e.render(t, true)
-			if !ok {
+			if v, ok := e.render(t, true); ok {
+				edits = append(edits, Edit{off, off + len(t.text), v})
+			} else {
 				rep.Unknown = append(rep.Unknown, unknownName(t))
-				b.WriteString(t.text)
-				continue
 			}
-			b.WriteString(v)
 		}
+		off += len(t.text)
 	}
-	return b.String(), rep
+	return edits, rep
 }
 
 // render resolves a placeholder token, including unreviewed names if asked.
@@ -227,28 +250,35 @@ func unknownName(t token) string {
 // Everything else, including escapes and unknown placeholders, is kept
 // verbatim so that Unfill can restore it.
 func (e *Engine) Fill(text string) (string, Report) {
-	var b strings.Builder
+	edits, rep := e.FillEdits(text)
+	return Apply(text, edits), rep
+}
+
+// FillEdits returns the edits Fill makes.
+func (e *Engine) FillEdits(text string) ([]Edit, Report) {
+	var edits []Edit
 	var rep Report
+	off := 0
 	for _, t := range e.syntax.scan(text) {
-		if t.kind != tokPlaceholder {
-			b.WriteString(t.text)
-			continue
+		if t.kind == tokPlaceholder {
+			if v, ok := e.render(t, false); ok {
+				edits = append(edits, Edit{off, off + len(t.text), v})
+			} else {
+				rep.Unknown = append(rep.Unknown, unknownName(t))
+			}
 		}
-		v, ok := e.render(t, false)
-		if !ok {
-			rep.Unknown = append(rep.Unknown, unknownName(t))
-			b.WriteString(t.text)
-			continue
-		}
-		b.WriteString(v)
+		off += len(t.text)
 	}
-	return b.String(), rep
+	return edits, rep
 }
 
 // Unfill converts filled text back to a template: vault values become
 // placeholders. Placeholder-like text already present is left untouched.
 // Unfill(Fill(t)) == t unless t contains a vault value as literal text.
-func (e *Engine) Unfill(text string) string {
+func (e *Engine) Unfill(text string) string { return Apply(text, e.UnfillEdits(text)) }
+
+// UnfillEdits returns the edits Unfill makes.
+func (e *Engine) UnfillEdits(text string) []Edit {
 	var reserved []span
 	off := 0
 	for _, t := range e.syntax.scan(text) {
@@ -271,15 +301,24 @@ func (e *Engine) Unfill(text string) string {
 			cands = append(cands, c)
 		}
 	}
-	var b strings.Builder
-	pos := 0
+	var edits []Edit
 	for _, m := range selectMatches(len(text), cands, reserved) {
-		b.WriteString(text[pos:m.start])
-		b.WriteString(e.syntax.Placeholder(m.name, m.mod))
-		pos = m.end
+		edits = append(edits, Edit{m.start, m.end, e.syntax.Placeholder(m.name, m.mod)})
 	}
-	b.WriteString(text[pos:])
-	return b.String()
+	return edits
+}
+
+// Leaks returns the names of hidden vault values (any case) that appear in
+// text on whole-word boundaries. Format handlers use it as a final check
+// that nothing slipped through parts they do not transform.
+func (e *Engine) Leaks(text string) []string {
+	var out []string
+	for _, m := range e.matchers {
+		if len(m.find(text)) > 0 {
+			out = append(out, m.name)
+		}
+	}
+	return out
 }
 
 func applyMod(v, mod string) string {

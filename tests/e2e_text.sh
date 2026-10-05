@@ -1,36 +1,7 @@
 #!/usr/bin/env bash
-# End-to-end test: real vault, real guises, real mount (NFS on macOS, FUSE on
-# Linux), edited with ordinary tools. Runs in a throwaway HOME so it never
-# touches your own guises.
-#
-#   scripts/e2e.sh [path/to/guise]     (default: builds ./cmd/guise)
-set -euo pipefail
-
-repo=$(cd "$(dirname "$0")/.." && pwd)
-G=${1:-}
-if [[ -z "$G" ]]; then
-	G=$(mktemp -d)/guise
-	(cd "$repo" && go build -o "$G" ./cmd/guise)
-fi
-G=$(cd "$(dirname "$G")" && pwd)/$(basename "$G")
-
-export HOME=$(mktemp -d)
-export XDG_CONFIG_HOME=$HOME/.config XDG_DATA_HOME=$HOME/.local/share
-cleanup() { "$G" stop >/dev/null 2>&1 || true; }
-trap cleanup EXIT
-cd "$HOME"
-
-pass=0
-check() { # check <description> <expected> <actual>
-	if [[ "$2" == "$3" ]]; then
-		pass=$((pass + 1))
-		printf 'ok   %s\n' "$1"
-	else
-		printf 'FAIL %s\n  want: %q\n  got:  %q\n' "$1" "$2" "$3"
-		exit 1
-	fi
-}
-settle() { sleep 1; } # write-back happens 300 ms after the last write
+# End-to-end: text files through file and directory guises, edited with
+# ordinary tools (shell, Python, vim, GNU sed), plus review and stop.
+source "$(dirname "$0")/lib.sh"
 
 mkdir -p docs/job/notes ai
 printf '# Matthew Wiltzius\nAustin · 512-555-0199\n' >docs/resume.md
@@ -39,10 +10,7 @@ printf 'call Wiltzius\n' >docs/job/notes/todo.txt
 printf '\x89PNG\x00binary' >docs/job/photo.png
 ln -s /etc/hosts docs/job/escape
 
-"$G" vault init --plain >/dev/null
-for kv in firstname=Matthew lastname=Wiltzius city=Austin; do
-	echo "${kv#*=}" | "$G" vault set "${kv%%=*}"
-done
+vault_values firstname=Matthew lastname=Wiltzius city=Austin
 
 # No start/mount command: `guise new` serves the guise immediately.
 "$G" new ~/docs/resume.md ~/ai/resume.md </dev/null >/dev/null
@@ -87,6 +55,23 @@ if sed --version >/dev/null 2>&1; then # GNU sed replaces symlinks with -i
 	check "...and its edit applied" "$title" "$(head -1 docs/resume.md)"
 fi
 
+# Word and other editors lock documents; without working locks Word opens
+# them read-only. A second process must be refused while the lock is held.
+locks=$(python3 - ai/job/cover.md <<'PY'
+import fcntl, os, subprocess, sys
+p = sys.argv[1]
+fd = os.open(p, os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # (macOS: flock and fcntl
+fcntl.flock(fd, fcntl.LOCK_UN)                  # locks conflict; test each)
+fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+other = subprocess.run([sys.executable, "-c",
+    f"import fcntl,os; fcntl.lockf(os.open({p!r}, os.O_RDWR), fcntl.LOCK_EX | fcntl.LOCK_NB)"],
+    capture_output=True)
+print("ok" if other.returncode != 0 else "second process got the lock")
+PY
+)
+check "file locks work and exclude other processes" "ok" "$locks"
+
 echo scrap >ai/job/scrap.md
 rm ai/job/scrap.md
 check "delete moves the target to the Trash" "no" "$([[ -e docs/job/scrap.md ]] && echo yes || echo no)"
@@ -101,4 +86,4 @@ check "review while serving" "{{pi.city}} · {{pi.phone}}" "$(sed -n 2p ai/resum
 check "stop makes guises unavailable" "no" "$([[ -e ai/resume.md ]] && echo yes || echo no)"
 check "targets survive" "$title" "$(head -1 docs/resume.md)"
 
-echo "e2e: $pass checks passed ($(uname -s))"
+finish

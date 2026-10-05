@@ -19,9 +19,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: test -z "$(gofmt -l .)" || (gofmt -l .; exit 1)
-      - run: go vet ./...
-      - run: go test -race ./...
+      - run: tests/run.sh unit
 
   e2e-linux:
     runs-on: ubuntu-latest
@@ -31,7 +29,7 @@ jobs:
         with:
           go-version-file: go.mod
       - run: sudo apt-get update && sudo apt-get install -y fuse3 vim
-      - run: scripts/e2e.sh
+      - run: tests/run.sh e2e
 
   e2e-macos:
     runs-on: macos-latest
@@ -40,4 +38,4 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: scripts/e2e.sh
+      - run: tests/run.sh e2e

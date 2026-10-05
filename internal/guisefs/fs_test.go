@@ -1,11 +1,14 @@
 package guisefs
 
 import (
+	"archive/zip"
+	"bytes"
 	"errors"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -467,5 +470,180 @@ func TestStaysResponsiveDuringVaultReload(t *testing.T) {
 	t.Logf("reload took %v; slowest request %v", time.Since(start), worst)
 	if worst > 200*time.Millisecond {
 		t.Fatalf("a request waited %v during the reload", worst)
+	}
+}
+
+// makeDocx builds a minimal Word document whose paragraphs hold the given
+// runs ("|" separates runs within a paragraph), plus any extra parts.
+func makeDocx(t *testing.T, paras []string, extra ...string) []byte {
+	t.Helper()
+	var body strings.Builder
+	for _, p := range paras {
+		body.WriteString("<w:p>")
+		for _, r := range strings.Split(p, "|") {
+			body.WriteString("<w:r><w:t>" + r + "</w:t></w:r>")
+		}
+		body.WriteString("</w:p>")
+	}
+	parts := append([]string{
+		"[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`,
+		"word/document.xml", `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>` + body.String() + `</w:body></w:document>`,
+	}, extra...)
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for i := 0; i < len(parts); i += 2 {
+		w, _ := zw.Create(parts[i])
+		w.Write([]byte(parts[i+1]))
+	}
+	zw.Close()
+	return buf.Bytes()
+}
+
+var wtRe = regexp.MustCompile(`<w:t(?:\s[^>]*)?>([^<]*)</w:t>`)
+
+// docText returns a Word document's text, one line per paragraph.
+func docText(t *testing.T, data []byte) string {
+	t.Helper()
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("not a zip: %v", err)
+	}
+	for _, f := range r.File {
+		if f.Name != "word/document.xml" {
+			continue
+		}
+		rc, _ := f.Open()
+		xml, _ := io.ReadAll(rc)
+		rc.Close()
+		var lines []string
+		for _, p := range strings.Split(string(xml), "</w:p>") {
+			if !strings.Contains(p, "<w:p>") {
+				continue
+			}
+			var b strings.Builder
+			for _, m := range wtRe.FindAllStringSubmatch(p, -1) {
+				b.WriteString(m[1])
+			}
+			lines = append(lines, b.String())
+		}
+		return strings.Join(lines, "\n")
+	}
+	t.Fatal("no word/document.xml")
+	return ""
+}
+
+func TestDocxInDirectoryGuise(t *testing.T) {
+	e := newEnv(t, map[string]string{"firstname": "Peter", "lastname": "Parker"})
+	dir := filepath.Join(e.root, "job")
+	os.MkdirAll(dir, 0o755)
+	target := filepath.Join(dir, "cv.docx")
+	os.WriteFile(target, makeDocx(t, []string{"Pe|ter Par|ker", "Hire me"}), 0o644)
+	id := e.add(dir, registry.KindDir, registry.ModeHide, rules.Config{})
+	f := e.fs()
+
+	if got := names(t, f, id); strings.Join(got, ",") != "cv.docx" {
+		t.Fatalf("listing = %v", got)
+	}
+	guise := []byte(readFile(t, f, id+"/cv.docx"))
+	if got := docText(t, guise); got != "{{pi.firstname}} {{pi.lastname}}\nHire me" {
+		t.Fatalf("guise text = %q", got)
+	}
+	if fi, _ := f.Stat(id + "/cv.docx"); fi.Size() != int64(len(guise)) {
+		t.Fatalf("size %d, read %d bytes", fi.Size(), len(guise))
+	}
+
+	// A save cut short must not touch the target...
+	edited := makeDocx(t, []string{"{{pi.lastname}}, {{pi.first|name}}", "Hire me now"})
+	writeFile(t, f, id+"/cv.docx", string(edited[:len(edited)/2]))
+	f.mu.Lock()
+	err := f.flushLocked(target, f.cache[target])
+	f.mu.Unlock()
+	if err == nil {
+		t.Fatal("half a document was accepted")
+	}
+	if got := docText(t, mustRead(t, target)); got != "Peter Parker\nHire me" {
+		t.Fatalf("target changed by a partial save: %q", got)
+	}
+	// ...and the complete save reaches it with real values.
+	writeFile(t, f, id+"/cv.docx", string(edited))
+	f.Close()
+	if got := docText(t, mustRead(t, target)); got != "Parker, Peter\nHire me now" {
+		t.Fatalf("target = %q", got)
+	}
+}
+
+func TestDocxWithUnhandledPIIsHidden(t *testing.T) {
+	e := newEnv(t, map[string]string{"lastname": "Parker"})
+	dir := filepath.Join(e.root, "job")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "cv.docx"), makeDocx(t, []string{"Parker"},
+		"word/webextensions/taskpane.xml", `<x note="Parker's add-in"/>`), 0o644)
+	id := e.add(dir, registry.KindDir, registry.ModeHide, rules.Config{})
+	f := e.fs()
+	if got := names(t, f, id); len(got) != 0 {
+		t.Fatalf("document with unhandled PI is visible: %v", got)
+	}
+}
+
+func mustRead(t *testing.T, p string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// A sandboxed app (Word) saves through a staging folder macOS creates next
+// to the document: write the new version inside it, move the original in as
+// a backup, move the new version out over the original, clean up. None of it
+// may appear in the target directory, and the target must get the new text.
+func TestSandboxedWordSave(t *testing.T) {
+	e := newEnv(t, map[string]string{"firstname": "Peter", "lastname": "Parker"})
+	dir := filepath.Join(e.root, "docs")
+	os.MkdirAll(dir, 0o755)
+	target := filepath.Join(dir, "cv.docx")
+	os.WriteFile(target, makeDocx(t, []string{"Peter Parker"}), 0o644)
+	id := e.add(dir, registry.KindDir, registry.ModeHide, rules.Config{})
+	f := e.fs()
+	g := func(p string) string { return id + "/" + p }
+
+	writeFile(t, f, g("~$cv.docx"), "owner lock")
+	stage := "cv.docx.sb-d4785637-AgmyQ4"
+	if err := f.MkdirAll(g(stage), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.MkdirAll(g(stage+"/~WRL4041.sb-d4785637-ewngkf"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, f, g(stage+"/~WRL4041.sb-d4785637-ewngkf/.~WRD3856"), "scratch")
+	writeFile(t, f, g(stage+"/.~WRD0000"), string(makeDocx(t, []string{"Hi, {{pi.firstname}} {{pi.lastname:upper}}"})))
+	if err := f.Rename(g("cv.docx"), g(stage+"/~WRL4041.tmp")); err != nil {
+		t.Fatalf("move original to backup: %v", err)
+	}
+	if err := f.Rename(g(stage+"/.~WRD0000"), g("cv.docx")); err != nil {
+		t.Fatalf("move new version into place: %v", err)
+	}
+	for _, p := range []string{stage + "/~WRL4041.tmp", stage + "/~WRL4041.sb-d4785637-ewngkf/.~WRD3856",
+		stage + "/~WRL4041.sb-d4785637-ewngkf", stage, "~$cv.docx"} {
+		if err := f.Remove(g(p)); err != nil {
+			t.Fatalf("remove %s: %v", p, err)
+		}
+	}
+	f.Close()
+
+	if got := docText(t, mustRead(t, target)); got != "Hi, Peter PARKER" {
+		t.Fatalf("target = %q", got)
+	}
+	entries, _ := os.ReadDir(dir)
+	var names []string
+	for _, en := range entries {
+		names = append(names, en.Name())
+	}
+	if strings.Join(names, ",") != "cv.docx" {
+		t.Fatalf("target directory = %v (staging files leaked into it)", names)
+	}
+	if len(e.trashed) != 0 {
+		t.Fatalf("trashed %v", e.trashed)
 	}
 }

@@ -2,19 +2,40 @@ package guisefs
 
 import (
 	"bytes"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
 	"unicode/utf8"
 
+	"github.com/mwiltzius/guise/internal/docx"
 	"github.com/mwiltzius/guise/internal/transform"
 )
+
+// format is how a target file is transformed.
+type format int
+
+const (
+	fmtText   format = iota // plain text: transformed as a whole
+	fmtDocx                 // Word document: run text transformed in place
+	fmtBinary               // anything else: never transformed
+)
+
+func detect(name string, data []byte) format {
+	switch {
+	case isText(data):
+		return fmtText
+	case docx.Is(name, data):
+		return fmtDocx
+	}
+	return fmtBinary
+}
 
 // content is the guise view of one target file.
 type content struct {
 	data    []byte // guise bytes
-	text    bool   // target is text (binary files are never transformed)
+	format  format
 	eng     *transform.Engine
 	srcMod  time.Time // target mtime/size the data was derived from
 	srcSize int64
@@ -28,8 +49,9 @@ type content struct {
 func isText(b []byte) bool { return utf8.Valid(b) && bytes.IndexByte(b, 0) < 0 }
 
 // loadLocked returns the guise view of a target file, re-deriving it when
-// the target or the engine changed. Binary files are hidden in hide mode
-// and passed through unchanged in fill mode.
+// the target or the engine changed. Binary files (and documents that cannot
+// be transformed safely) are hidden in hide mode and passed through
+// unchanged in fill mode.
 func (f *FS) loadLocked(n node) (*content, error) {
 	e, err := f.engine(n.g, n.rel)
 	if err != nil {
@@ -47,7 +69,7 @@ func (f *FS) loadLocked(n node) (*content, error) {
 		return nil, errHidden
 	}
 	if c != nil && c.eng == e && c.srcMod.Equal(fi.ModTime()) && c.srcSize == fi.Size() {
-		if !c.text && n.g.hide() {
+		if c.format == fmtBinary && n.g.hide() {
 			return nil, errHidden
 		}
 		return c, nil
@@ -56,11 +78,17 @@ func (f *FS) loadLocked(n node) (*content, error) {
 	if err != nil {
 		return nil, err
 	}
-	next := &content{text: isText(raw), eng: e, srcMod: fi.ModTime(), srcSize: fi.Size(),
+	next := &content{format: detect(n.real, raw), eng: e, srcMod: fi.ModTime(), srcSize: fi.Size(),
 		modTime: fi.ModTime(), g: n.g, name: n.g.rec.ID + "/" + n.rel}
-	if next.text {
+	switch next.format {
+	case fmtText:
 		next.data = []byte(f.forward(n.g, e, string(raw)))
-	} else {
+	case fmtDocx:
+		if next.data, err = f.forwardDocx(n.g, e, raw); err != nil {
+			f.opt.Logf("%s: not shown: %v", next.name, err)
+			next.format, next.data = fmtBinary, raw
+		}
+	default:
 		next.data = raw
 	}
 	// Same target but different output (e.g. the vault changed): bump the
@@ -69,7 +97,7 @@ func (f *FS) loadLocked(n node) (*content, error) {
 		next.modTime = time.Now()
 	}
 	f.cache[n.real] = next
-	if !next.text && n.g.hide() {
+	if next.format == fmtBinary && n.g.hide() {
 		return nil, errHidden
 	}
 	return next, nil
@@ -81,7 +109,7 @@ func (f *FS) newContentLocked(n node) (*content, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &content{text: true, eng: e, modTime: time.Now(), g: n.g, name: n.g.rec.ID + "/" + n.rel}
+	c := &content{format: fmtText, eng: e, modTime: time.Now(), g: n.g, name: n.g.rec.ID + "/" + n.rel}
 	f.cache[n.real] = c
 	return c, nil
 }
@@ -115,9 +143,24 @@ func (f *FS) flushLocked(real string, c *content) error {
 		c.timer.Stop()
 		c.timer = nil
 	}
+	// What was written decides how it is converted: an editor may replace
+	// a text file with a document or vice versa.
+	format := detect(real, c.data)
 	out := c.data
-	if isText(c.data) {
+	switch format {
+	case fmtText:
 		out = []byte(f.inverse(c.g, c.eng, string(c.data), c.name))
+	case fmtDocx:
+		var err error
+		if out, err = f.inverseDocx(c.g, c.eng, c.data, c.name); err != nil {
+			// Leave the target as it was rather than write a document we
+			// could not convert (e.g. a save still in progress).
+			return err
+		}
+	default:
+		if c.format == fmtDocx {
+			return errors.New("not a complete Word document yet; target left unchanged")
+		}
 	}
 	if err := writeAtomic(real, out); err != nil {
 		return err
@@ -127,7 +170,7 @@ func (f *FS) flushLocked(real string, c *content) error {
 		return err
 	}
 	c.srcMod, c.srcSize, c.dirty = fi.ModTime(), fi.Size(), false
-	c.text = isText(c.data)
+	c.format = format
 	return nil
 }
 
