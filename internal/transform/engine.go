@@ -24,13 +24,17 @@ type Config struct {
 	// Ignore lists exact text that detectors should not flag, e.g. matches
 	// the user reviewed and marked as not sensitive.
 	Ignore []string
+	// Expose lists vault names whose real values stay visible in the guise.
+	// Placeholders for them still render.
+	Expose []string
 }
 
 // Engine converts text in both directions. It is safe for concurrent use.
 type Engine struct {
 	syntax     Syntax
 	values     map[string]string
-	matchers   []valueMatcher
+	matchers   []valueMatcher // values hidden by Hide
+	all        []valueMatcher // every value, for Unfill
 	detectors  []Detector
 	unreviewed *Unreviewed
 	variants   *Variants
@@ -69,6 +73,10 @@ func New(cfg Config) (*Engine, error) {
 	for _, s := range cfg.Ignore {
 		e.ignore[s] = true
 	}
+	exposed := make(map[string]bool, len(cfg.Expose))
+	for _, name := range cfg.Expose {
+		exposed[name] = true
+	}
 	names := make([]string, 0, len(cfg.Values))
 	for name := range cfg.Values {
 		names = append(names, name)
@@ -80,7 +88,13 @@ func New(cfg Config) (*Engine, error) {
 			return nil, err
 		}
 		e.values[name] = value
-		e.matchers = append(e.matchers, newValueMatcher(name, value))
+		m := newValueMatcher(name, value)
+		e.all = append(e.all, m)
+		if exposed[name] {
+			e.ignore[value] = true // don't let a detector hide it either
+		} else {
+			e.matchers = append(e.matchers, m)
+		}
 	}
 	return e, nil
 }
@@ -245,7 +259,7 @@ func (e *Engine) Unfill(text string) string {
 	}
 	reserved = append(reserved, e.syntax.triggers(text)...)
 	var cands []match
-	for _, m := range e.matchers {
+	for _, m := range e.all {
 		for _, c := range m.find(text) {
 			if c.irregular { // only spellings already recorded are restored
 				n := e.variants.find(c.name, text[c.start:c.end])

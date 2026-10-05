@@ -270,6 +270,10 @@ func TestResolve(t *testing.T) {
 	}
 
 	check("", "", filepath.Join(root, "config", "guise", "vault.age"), FromDefault)
+	plainDefault := filepath.Join(root, "config", "guise", "vault.toml")
+	must(t, os.MkdirAll(filepath.Dir(plainDefault), 0o700))
+	must(t, os.WriteFile(plainDefault, nil, 0o600))
+	check("", "", plainDefault, FromDefault)
 
 	pv := filepath.Join(project, ProjectDir, "vault.toml")
 	must(t, os.MkdirAll(filepath.Dir(pv), 0o700))

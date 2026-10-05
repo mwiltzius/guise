@@ -75,6 +75,19 @@ func (u *Unreviewed) assign(kind, value string) string {
 	return name
 }
 
+// Restore adds an entry with a known name, e.g. when merging entries
+// recorded in memory into a vault reloaded from disk.
+func (u *Unreviewed) Restore(name, value string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.byName[name] = value
+	u.byValue[value] = name
+	if kind, n := splitUnreviewed(name); n >= u.next[kind] {
+		u.next[kind] = n + 1
+	}
+	u.dirty = true
+}
+
 // Lookup returns the text an unreviewed name stands for.
 func (u *Unreviewed) Lookup(name string) (string, bool) {
 	u.mu.Lock()

@@ -37,6 +37,7 @@ import (
 	"filippo.io/age"
 	"github.com/BurntSushi/toml"
 
+	"guise/internal/rules"
 	"guise/internal/transform"
 )
 
@@ -326,6 +327,18 @@ func (v *Vault) RemovePattern(name string) bool {
 	return ok
 }
 
+// Rules returns the vault's layer of rules: its patterns and ignore list.
+func (v *Vault) Rules() rules.Rules {
+	r := rules.Rules{Ignore: append([]string(nil), v.ignore...)}
+	if len(v.patterns) > 0 {
+		r.Patterns = make(map[string]string, len(v.patterns))
+		for k, p := range v.patterns {
+			r.Patterns[k] = p
+		}
+	}
+	return r
+}
+
 // Unreviewed returns the set of detector matches awaiting review.
 func (v *Vault) Unreviewed() *transform.Unreviewed { return v.unreviewed }
 
@@ -419,4 +432,16 @@ func (v *Vault) Engine(mode Mode) (*transform.Engine, error) {
 		cfg.Ignore = v.ignore
 	}
 	return transform.New(cfg)
+}
+
+// IsEncrypted reports whether the vault file at path is age-encrypted.
+func IsEncrypted(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	head := make([]byte, len(ageHeader))
+	n, _ := io.ReadFull(f, head)
+	return string(head[:n]) == ageHeader, nil
 }

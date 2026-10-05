@@ -231,6 +231,22 @@ func TestFillUsesRecordedVariants(t *testing.T) {
 	}
 }
 
+func TestExpose(t *testing.T) {
+	values := map[string]string{"city": "Austin", "street": "123 Main St.", "email": "me@example.org"}
+	e, err := New(Config{Values: values, Detectors: BuiltinDetectors(), Expose: []string{"city", "email"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := "123 Main St., Austin. Mail me@example.org"
+	g := e.Hide(orig)
+	if g != "{{pi.street}}, Austin. Mail me@example.org" {
+		t.Fatalf("got %q", g)
+	}
+	if r := reveal(t, e, g+" {{pi.city}}"); r != orig+" Austin" {
+		t.Fatalf("exposed placeholder not rendered: %q", r)
+	}
+}
+
 func TestCustomSyntax(t *testing.T) {
 	e, err := New(Config{Syntax: Syntax{Open: "<<", Close: ">>", Prefix: "v"}, Values: testValues})
 	if err != nil {

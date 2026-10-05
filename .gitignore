@@ -25,3 +25,6 @@ coverage.*
 .vscode/
 *.swp
 *~
+
+# Local manual-testing area
+/tests/

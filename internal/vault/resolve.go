@@ -92,11 +92,18 @@ func ConfigDir() (string, error) {
 	return filepath.Join(base, "guise"), nil
 }
 
-// DefaultPath is the user's default vault (encrypted).
+// DefaultPath is the user's default vault: vault.age or vault.toml in the
+// config directory, whichever exists (vault.age if neither does).
 func DefaultPath() (string, error) {
 	dir, err := ConfigDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "vault.age"), nil
+	for _, name := range projectFiles { // vault.age, then vault.toml
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return filepath.Join(dir, projectFiles[0]), nil
 }

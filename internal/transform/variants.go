@@ -71,6 +71,17 @@ func (v *Variants) assign(name, spelling string) int {
 	return next
 }
 
+// Restore records a spelling under a known number.
+func (v *Variants) Restore(name string, n int, spelling string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.byName[name] == nil {
+		v.byName[name] = map[int]string{}
+	}
+	v.byName[name][n] = spelling
+	v.dirty = true
+}
+
 // Lookup returns variant n of name.
 func (v *Variants) Lookup(name string, n int) (string, bool) {
 	v.mu.Lock()
