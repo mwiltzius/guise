@@ -36,11 +36,13 @@ Vaults:
   review promote <unreviewed-name> [as <name>]
   review dismiss <unreviewed-name>
 
-Mount:
-  mount start             mount guises (asks for vault passphrases)
-        --foreground      stay in the foreground
-  mount stop              unmount
-  mount status            show whether guises are mounted
+Guises are served by a background process that starts automatically.
+These commands are only needed to inspect or control it:
+  status                  show what is being served and which vaults are locked
+  unlock                  unlock encrypted vaults (e.g. after login)
+  start [--foreground]    start serving now
+  stop                    stop serving (guises become unavailable)
+  autostart [on|off]      start serving at login
 
 Global flags:
   --vault V               vault for vault/review commands (default: $GUISE_VAULT,
@@ -80,8 +82,18 @@ func run(args []string) error {
 		return cmdVault(rest)
 	case "review":
 		return cmdReview(rest)
-	case "mount":
-		return cmdMount(rest)
+	case "status":
+		return cmdStatus(rest)
+	case "unlock":
+		return cmdUnlock(rest)
+	case "start":
+		return cmdStart(rest)
+	case "stop":
+		return cmdStop(rest)
+	case "autostart":
+		return cmdAutostart(rest)
+	case "_serve": // internal: the background process
+		return cmdServe(rest)
 	}
 	return fmt.Errorf("unknown command %q (see `guise help`)", cmd)
 }

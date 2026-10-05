@@ -42,7 +42,6 @@ func statePaths() (paths, error) {
 	return paths{config: cfg, mount: mnt, scratch: filepath.Join(cache, "guise", "scratch")}, nil
 }
 
-func (p paths) pidFile() string { return filepath.Join(p.config, "mount.pid") }
 func (p paths) logFile() string { return filepath.Join(p.config, "mount.log") }
 
 // absPath makes p absolute without resolving symlinks.
@@ -95,9 +94,10 @@ func confirm(prompt string) bool {
 	return err == nil && (ans == "" || strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes"))
 }
 
-// passphraseFor prompts for a vault's passphrase.
+// passphraseFor prompts for a vault's passphrase (or reuses one entered
+// earlier in this command).
 func passphraseFor(path string) vault.PassphraseFunc {
-	return func() ([]byte, error) { return readSecret("Passphrase for " + path + ": ") }
+	return func() ([]byte, error) { return unlockVault(path) }
 }
 
 // newPassphrase prompts twice for a new passphrase.

@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
-	"guise/internal/nfsmount"
 	"guise/internal/registry"
 	"guise/internal/rules"
 	"guise/internal/vault"
@@ -65,9 +65,15 @@ func cmdNew(args []string) error {
 			if src != vault.FromDefault || !confirm("No vault yet. Create an encrypted vault at "+p+"?") {
 				return fmt.Errorf("no vault at %s; create one with `guise vault init`", p)
 			}
-			if _, err := vault.Create(p, true, newPassphrase); err != nil {
+			var created []byte
+			if _, err := vault.Create(p, true, func() ([]byte, error) {
+				pw, err := newPassphrase()
+				created = pw
+				return pw, err
+			}); err != nil {
 				return err
 			}
+			known[p] = created
 		}
 		vaultPaths = []string{p}
 	}
@@ -111,22 +117,27 @@ func cmdNew(args []string) error {
 		registry.Update(p.config, func(r *registry.Registry) error { r.Remove(link); return nil })
 		return err
 	}
-	fmt.Printf("%s → guise of %s (%s mode)\n", link, target, g.Mode)
-	if !nfsmount.Mounted(p.mount) {
-		fmt.Println("Guises are not mounted yet; run `guise mount start`.")
-	} else if anyEncrypted(vaultPaths) {
-		fmt.Println("If this guise uses a vault the mount has not unlocked, restart it: `guise mount stop && guise mount start`.")
+	if err := ensureServing(p, vaultPaths); err != nil {
+		return fmt.Errorf("created %s, but it cannot be served yet: %w", link, err)
 	}
+	if err := waitReady(link); err != nil {
+		return err
+	}
+	fmt.Printf("%s → guise of %s (%s mode)\n", link, target, g.Mode)
+	offerAutostart(p)
 	return nil
 }
 
-func anyEncrypted(paths []string) bool {
-	for _, p := range paths {
-		if enc, _ := vault.IsEncrypted(p); enc {
-			return true
+// waitReady waits until the guise can be opened.
+func waitReady(link string) error {
+	var err error
+	for i := 0; i < 50; i++ {
+		if _, err = os.Stat(link); err == nil {
+			return nil
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return false
+	return fmt.Errorf("%s is not available yet: %w (see `guise status`)", link, err)
 }
 
 func cmdRm(args []string) error {
@@ -193,8 +204,10 @@ func cmdList(args []string) error {
 		fmt.Fprintf(tw, "%s\t%s%s\t%s\t%s\n", g.Path, g.Target, status, g.Mode, strings.Join(g.Vaults, ", "))
 	}
 	tw.Flush()
-	if !nfsmount.Mounted(p.mount) {
-		fmt.Println("\nNot mounted; run `guise mount start`.")
+	if resp, err := status(p); err != nil {
+		fmt.Println("\nNot being served; run `guise start` (or any `guise new`).")
+	} else if len(resp.Locked) > 0 {
+		fmt.Printf("\n%d vault(s) locked; run `guise unlock`.\n", len(resp.Locked))
 	}
 	return nil
 }

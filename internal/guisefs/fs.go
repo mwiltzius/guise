@@ -21,6 +21,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -142,6 +143,41 @@ func (f *FS) refreshLocked(force bool) error {
 		}
 	}
 	return nil
+}
+
+// Reopen re-reads the registry now and retries guises whose vaults could
+// not be opened before (e.g. after a passphrase was supplied).
+func (f *FS) Reopen() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, g := range f.guises {
+		if g.stack == nil {
+			delete(f.guises, id)
+		}
+	}
+	return f.refreshLocked(true)
+}
+
+// Unavailable returns the paths of guises that cannot be served because
+// their vaults could not be opened.
+func (f *FS) Unavailable() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, g := range f.guises {
+		if g.stack == nil {
+			out = append(out, g.rec.Path)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Guises returns the number of registered guises.
+func (f *FS) Guises() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.guises)
 }
 
 func sameRecord(a, b registry.Guise) bool { return sameJSON(a, b) }

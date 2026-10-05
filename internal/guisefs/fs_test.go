@@ -363,3 +363,30 @@ func TestUnavailableVaultFailsClosed(t *testing.T) {
 		t.Fatal("guise readable without its vault")
 	}
 }
+
+func TestReopenAfterUnlock(t *testing.T) {
+	e := newEnv(t, person)
+	target := e.write("docs/a.md", "Matthew\n")
+	id := e.add(target, registry.KindFile, registry.ModeHide, rules.Config{})
+	f, err := New(Options{ConfigDir: e.config, ScratchDir: e.scratch, Logf: t.Logf,
+		PassFor: func(string) vault.PassphraseFunc { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate guises whose vault was locked at startup.
+	f.mu.Lock()
+	for _, g := range f.guises {
+		g.stack = nil
+	}
+	f.mu.Unlock()
+	if got := f.Unavailable(); len(got) != 1 {
+		t.Fatalf("unavailable = %v", got)
+	}
+	if err := f.Reopen(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, f, id+"/a.md"); got != "{{pi.firstname}}\n" {
+		t.Fatalf("after reopen: %q", got)
+	}
+}
