@@ -8,7 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"guise/internal/transform"
+	"github.com/mwiltzius/guise/internal/transform"
 )
 
 // content is the guise view of one target file.

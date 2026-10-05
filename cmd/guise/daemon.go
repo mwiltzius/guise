@@ -16,11 +16,11 @@ import (
 	"syscall"
 	"time"
 
-	"guise/internal/control"
-	"guise/internal/guisefs"
-	"guise/internal/nfsmount"
-	"guise/internal/registry"
-	"guise/internal/vault"
+	"github.com/mwiltzius/guise/internal/control"
+	"github.com/mwiltzius/guise/internal/guisefs"
+	"github.com/mwiltzius/guise/internal/mount"
+	"github.com/mwiltzius/guise/internal/registry"
+	"github.com/mwiltzius/guise/internal/vault"
 )
 
 // The background process serves guises. It is started automatically by
@@ -235,8 +235,8 @@ func cmdStop(args []string) error {
 	}
 	resp, err := send(p, control.Request{Op: control.OpStop})
 	if err != nil {
-		if nfsmount.Mounted(p.mount) { // left over from a crash
-			return nfsmount.Unmount(p.mount)
+		if mount.Mounted(p.mount) { // left over from a crash
+			return mount.Unmount(p.mount)
 		}
 		fmt.Println("Not running.")
 		return nil
@@ -374,7 +374,7 @@ func serve(p paths, in io.Reader) error {
 		return err
 	}
 	defer l.Close()
-	if err := nfsmount.Unmount(p.mount); err != nil { // stale mount from a crash
+	if err := mount.Unmount(p.mount); err != nil { // stale mount from a crash
 		return err
 	}
 
@@ -394,7 +394,7 @@ func serve(p paths, in io.Reader) error {
 	if err != nil {
 		return err
 	}
-	srv, err := nfsmount.Start(fsys, p.mount)
+	srv, err := mount.Start(fsys, p.mount)
 	if err != nil {
 		fsys.Close()
 		return err
@@ -447,6 +447,19 @@ func serve(p paths, in io.Reader) error {
 			Unavailable: fsys.Unavailable(), Guises: fsys.Guises()}
 	})
 
+	// Repair file guises whose symlink a tool replaced with a regular file.
+	go func() {
+		for range time.Tick(2 * time.Second) {
+			healed, err := fsys.HealLinks(p.mount)
+			for _, h := range healed {
+				log.Printf("restored guise link %s (a tool had replaced it; its edit was applied)", h)
+			}
+			if err != nil {
+				log.Printf("restoring guise links: %v", err)
+			}
+		}
+	}()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -461,10 +474,4 @@ func serve(p paths, in io.Reader) error {
 	stopErr := srv.Stop()
 	closeErr := fsys.Close()
 	return errors.Join(stopErr, closeErr)
-}
-
-// notify shows a desktop notification (macOS), best effort.
-func notify(msg string) {
-	script := fmt.Sprintf("display notification %q with title \"guise\"", msg)
-	exec.Command("/usr/bin/osascript", "-e", script).Run()
 }

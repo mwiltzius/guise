@@ -13,9 +13,9 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 
-	"guise/internal/registry"
-	"guise/internal/rules"
-	"guise/internal/vault"
+	"github.com/mwiltzius/guise/internal/registry"
+	"github.com/mwiltzius/guise/internal/rules"
+	"github.com/mwiltzius/guise/internal/vault"
 )
 
 type env struct {
@@ -388,5 +388,32 @@ func TestReopenAfterUnlock(t *testing.T) {
 	}
 	if got := readFile(t, f, id+"/a.md"); got != "{{pi.firstname}}\n" {
 		t.Fatalf("after reopen: %q", got)
+	}
+}
+
+// A tool replaced the guise symlink with a regular file holding edited guise
+// text: the edit reaches the target and the symlink comes back.
+func TestHealLinks(t *testing.T) {
+	e := newEnv(t, person)
+	target := e.write("docs/resume.md", "Matthew\n")
+	id := e.add(target, registry.KindFile, registry.ModeHide, rules.Config{})
+	f := e.fs()
+	link := filepath.Join(e.root, "links", "resume.md")
+	os.MkdirAll(filepath.Dir(link), 0o755)
+	os.WriteFile(link, []byte("Hi {{pi.firstname}} {{pi.lastname}}\n"), 0o644) // what sed -i leaves behind
+
+	healed, err := f.HealLinks("/mnt")
+	if err != nil || len(healed) != 1 {
+		t.Fatalf("healed %v, err %v", healed, err)
+	}
+	if got := e.read(target); got != "Hi Matthew Wiltzius\n" {
+		t.Fatalf("target = %q", got)
+	}
+	dest, err := os.Readlink(link)
+	if err != nil || dest != filepath.Join("/mnt", id, "resume.md") {
+		t.Fatalf("link = %q, %v", dest, err)
+	}
+	if again, _ := f.HealLinks("/mnt"); len(again) != 0 {
+		t.Fatalf("healed twice: %v", again)
 	}
 }

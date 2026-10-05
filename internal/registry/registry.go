@@ -15,7 +15,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"guise/internal/rules"
+	"github.com/mwiltzius/guise/internal/rules"
 )
 
 // Modes.

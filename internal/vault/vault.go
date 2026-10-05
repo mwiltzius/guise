@@ -37,8 +37,8 @@ import (
 	"filippo.io/age"
 	"github.com/BurntSushi/toml"
 
-	"guise/internal/rules"
-	"guise/internal/transform"
+	"github.com/mwiltzius/guise/internal/rules"
+	"github.com/mwiltzius/guise/internal/transform"
 )
 
 // PassphraseFunc supplies a passphrase when one is needed. It is not called

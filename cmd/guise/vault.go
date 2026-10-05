@@ -8,8 +8,8 @@ import (
 	"sort"
 	"strings"
 
-	"guise/internal/transform"
-	"guise/internal/vault"
+	"github.com/mwiltzius/guise/internal/transform"
+	"github.com/mwiltzius/guise/internal/vault"
 )
 
 func cmdVault(args []string) error {

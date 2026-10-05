@@ -10,7 +10,8 @@ import (
 	"strings"
 )
 
-const version = "0.1.0-dev"
+// version is set at release time with -ldflags "-X main.version=...".
+var version = "0.1.0-dev"
 
 const usage = `guise — the same file, in a different guise
 

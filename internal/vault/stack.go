@@ -8,8 +8,8 @@ import (
 	"sort"
 	"time"
 
-	"guise/internal/rules"
-	"guise/internal/transform"
+	"github.com/mwiltzius/guise/internal/rules"
+	"github.com/mwiltzius/guise/internal/transform"
 )
 
 // Stack combines several vaults for one guise. The first vault is primary:

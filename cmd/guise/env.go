@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/term"
 
-	"guise/internal/vault"
+	"github.com/mwiltzius/guise/internal/vault"
 )
 
 // Paths used by guise. The mount point lives at a short, stable path

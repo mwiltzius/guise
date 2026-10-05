@@ -1,0 +1,59 @@
+# GoReleaser configuration: `goreleaser release` on a version tag builds
+# release archives and Linux packages. Homebrew users build from source with
+# the formula in packaging/homebrew (no unsigned-binary quarantine issues).
+version: 2
+
+project_name: guise
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - main: ./cmd/guise
+    binary: guise
+    env:
+      - CGO_ENABLED=0 # pure Go: NFS and FUSE backends need no C libraries
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+nfpms:
+  - package_name: guise
+    vendor: guise
+    homepage: https://github.com/mwiltzius/guise
+    maintainer: Matthew Wiltzius <matt.wiltzius@gmail.com>
+    description: |-
+      Present files in a different guise: the same file at another path,
+      with personal information swapped for placeholders.
+    license: GPL-3.0-only
+    formats: [deb, rpm, apk, archlinux]
+    dependencies:
+      - fuse3 # provides fusermount3, which mounts without root
+    bindir: /usr/bin
+    contents:
+      - src: LICENSE
+        dst: /usr/share/licenses/guise/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/guise/README.md
+
+release:
+  github:
+    owner: mwiltzius
+    name: guise
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:"]

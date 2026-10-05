@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path"
@@ -26,10 +27,10 @@ import (
 	"sync"
 	"time"
 
-	"guise/internal/registry"
-	"guise/internal/rules"
-	"guise/internal/transform"
-	"guise/internal/vault"
+	"github.com/mwiltzius/guise/internal/registry"
+	"github.com/mwiltzius/guise/internal/rules"
+	"github.com/mwiltzius/guise/internal/transform"
+	"github.com/mwiltzius/guise/internal/vault"
 )
 
 // Options configures an FS.
@@ -402,4 +403,65 @@ func (f *FS) checkExposed(g *guiseState, real string) error {
 		}
 	}
 	return nil
+}
+
+// HealLinks repairs file guises whose symlink was replaced by a regular
+// file, as tools like GNU `sed -i` (without --follow-symlinks) do. The
+// file's contents were derived from the guise, so they are written through
+// the guise (reaching the target with real values), and the symlink into
+// mountpoint is restored. It returns the repaired guise paths.
+func (f *FS) HealLinks(mountpoint string) ([]string, error) {
+	f.mu.Lock()
+	var todo []*guiseState
+	for _, g := range f.guises {
+		if g.rec.Kind == registry.KindFile && g.stack != nil {
+			todo = append(todo, g)
+		}
+	}
+	f.mu.Unlock()
+
+	var healed []string
+	var errs []error
+	for _, g := range todo {
+		fi, err := os.Lstat(g.rec.Path)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue // still a symlink, or gone
+		}
+		if err := f.heal(g, mountpoint); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", g.rec.Path, err))
+			continue
+		}
+		healed = append(healed, g.rec.Path)
+	}
+	return healed, errors.Join(errs...)
+}
+
+func (f *FS) heal(g *guiseState, mountpoint string) error {
+	data, err := os.ReadFile(g.rec.Path)
+	if err != nil {
+		return err
+	}
+	base := filepath.Base(g.rec.Target)
+	h, err := f.OpenFile(path.Join("/", g.rec.ID, base), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := h.Write(data); err != nil {
+		return err
+	}
+	h.Close()
+	f.mu.Lock()
+	if c := f.cache[g.rec.Target]; c != nil {
+		err = f.flushLocked(g.rec.Target, c)
+	}
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	tmp := g.rec.Path + ".guise-relink"
+	os.Remove(tmp)
+	if err := os.Symlink(filepath.Join(mountpoint, g.rec.ID, base), tmp); err != nil {
+		return err
+	}
+	return os.Rename(tmp, g.rec.Path)
 }

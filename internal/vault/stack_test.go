@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"guise/internal/rules"
+	"github.com/mwiltzius/guise/internal/rules"
 )
 
 func plainVault(t *testing.T, path string, values map[string]string) {

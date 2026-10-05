@@ -10,9 +10,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"guise/internal/registry"
-	"guise/internal/rules"
-	"guise/internal/vault"
+	"github.com/mwiltzius/guise/internal/registry"
+	"github.com/mwiltzius/guise/internal/rules"
+	"github.com/mwiltzius/guise/internal/vault"
 )
 
 func cmdNew(args []string) error {

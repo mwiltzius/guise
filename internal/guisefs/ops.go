@@ -15,7 +15,7 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 
-	"guise/internal/registry"
+	"github.com/mwiltzius/guise/internal/registry"
 )
 
 var (
