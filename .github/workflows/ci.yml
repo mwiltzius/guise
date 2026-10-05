@@ -35,8 +35,6 @@ jobs:
 
   e2e-macos:
     runs-on: macos-latest
-    # Mounting a local NFS share has not been verified on hosted runners yet.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6

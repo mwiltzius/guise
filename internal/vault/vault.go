@@ -185,6 +185,15 @@ func Load(path string, pass PassphraseFunc) (*Vault, error) {
 
 // Save writes the vault atomically with owner-only permissions.
 func (v *Vault) Save(path string) error {
+	plain, err := v.encode()
+	if err != nil {
+		return err
+	}
+	return writeVault(path, plain, v.Encrypted, v.passphrase)
+}
+
+// encode renders the vault as TOML (fast).
+func (v *Vault) encode() ([]byte, error) {
 	f := fileFormat{
 		Settings:   settings{Prefix: v.prefix},
 		Values:     v.values,
@@ -202,11 +211,18 @@ func (v *Vault) Save(path string) error {
 	}
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(f); err != nil {
-		return err
+		return nil, err
 	}
-	data := buf.Bytes()
-	if v.Encrypted {
-		rcpt, err := age.NewScryptRecipient(string(v.passphrase))
+	return buf.Bytes(), nil
+}
+
+// writeVault encrypts (slow, by design: scrypt) if needed and writes
+// atomically. It touches no Vault state, so callers can run it without
+// holding their locks.
+func writeVault(path string, plain []byte, encrypted bool, passphrase []byte) error {
+	data := plain
+	if encrypted {
+		rcpt, err := age.NewScryptRecipient(string(passphrase))
 		if err != nil {
 			return err
 		}

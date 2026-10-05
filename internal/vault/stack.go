@@ -183,11 +183,59 @@ func (s *Stack) Changed() bool {
 	return false
 }
 
-// Reload re-reads vaults modified on disk (reusing their passphrases) while
-// keeping variants and unreviewed entries recorded in memory since the last
-// save. Entries removed on disk (e.g. promoted or dismissed via the CLI)
-// stay removed.
-func (s *Stack) Reload() error {
+// Reloading and saving are split into phases so a caller that guards the
+// stack with a lock (the guise filesystem) can do the slow part — scrypt,
+// about a second per encrypted vault by design — without holding it:
+//
+//	jobs := s.ReloadJobs()   // under the lock
+//	RunJobs(jobs)            // without it
+//	s.ApplyReload(jobs)      // under the lock
+//
+// and likewise SaveJobs / RunJobs / FinishSave. Reload and Save do all three
+// for callers without such a lock.
+
+// Job is one vault file to read or write.
+type Job struct {
+	i     int
+	path  string
+	pass  []byte
+	run   func(*Job) error
+	err   error
+	mtime time.Time // file mtime after the job ran
+
+	loaded *Vault // reload: the vault read from disk
+	plain  []byte // save: the TOML to write
+	enc    bool
+}
+
+// RunJobs runs the slow part of each job. It touches no stack state.
+func RunJobs(jobs []*Job) {
+	for _, j := range jobs {
+		j.err = j.run(j)
+		j.mtime = mtime(j.path)
+	}
+}
+
+// ReloadJobs returns jobs to re-read vault files changed on disk.
+func (s *Stack) ReloadJobs() []*Job {
+	var jobs []*Job
+	for i, p := range s.paths {
+		if mtime(p).Equal(s.mtimes[i]) {
+			continue
+		}
+		jobs = append(jobs, &Job{i: i, path: p, pass: s.vaults[i].passphrase, run: func(j *Job) error {
+			v, err := Load(j.path, func() ([]byte, error) { return j.pass, nil })
+			j.loaded = v
+			return err
+		}})
+	}
+	return jobs
+}
+
+// ApplyReload swaps in reloaded vaults, keeping variants and unreviewed
+// entries recorded in memory since the last save. Entries removed on disk
+// (e.g. promoted or dismissed via the CLI) stay removed.
+func (s *Stack) ApplyReload(jobs []*Job) error {
 	pending := map[string]map[int]string{}
 	for name, spellings := range s.variants.Entries() {
 		for n, spelling := range spellings {
@@ -205,17 +253,14 @@ func (s *Stack) Reload() error {
 			pendingU[name] = value
 		}
 	}
-	for i, p := range s.paths {
-		if mtime(p).Equal(s.mtimes[i]) {
+	var errs []error
+	for _, j := range jobs {
+		if j.err != nil {
+			errs = append(errs, j.err)
 			continue
 		}
-		pass := s.vaults[i].passphrase
-		v, err := Load(p, func() ([]byte, error) { return pass, nil })
-		if err != nil {
-			return err
-		}
-		s.vaults[i] = v
-		s.mtimes[i] = mtime(p)
+		s.vaults[j.i] = j.loaded
+		s.mtimes[j.i] = j.mtime
 	}
 	if err := s.rebuild(); err != nil {
 		return err
@@ -246,7 +291,17 @@ func (s *Stack) Reload() error {
 			}
 		}
 	}
-	return s.rebuild()
+	if err := s.rebuild(); err != nil {
+		return err
+	}
+	return errors.Join(errs...)
+}
+
+// Reload re-reads vaults modified on disk (see ApplyReload).
+func (s *Stack) Reload() error {
+	jobs := s.ReloadJobs()
+	RunJobs(jobs)
+	return s.ApplyReload(jobs)
 }
 
 // ownerIndex finds the first vault (in the current vaults) defining name.
@@ -259,16 +314,17 @@ func (s *Stack) ownerIndex(name string) int {
 	return -1
 }
 
-// Save writes recorded variants to the vaults that own them and unreviewed
-// entries to the primary vault. Vaults changed on disk are reloaded first so
-// edits made elsewhere (e.g. the CLI) are not lost.
-func (s *Stack) Save() error {
+// SaveJobs prepares writes of recorded variants to the vaults that own them
+// and unreviewed entries to the primary vault, for vaults whose contents
+// changed since the last save. It returns ErrChangedOnDisk if a vault file
+// was modified elsewhere: reload first so those edits are not lost.
+func (s *Stack) SaveJobs() ([]*Job, error) {
 	if s.Changed() {
-		if err := s.Reload(); err != nil {
-			return err
-		}
+		return nil, ErrChangedOnDisk
 	}
 	combined := s.variants.Entries()
+	unreviewed := s.Primary().unreviewed.Entries()
+	var jobs []*Job
 	for i, v := range s.vaults {
 		before := v.variants.Entries()
 		after := v.variants.Entries()
@@ -277,15 +333,63 @@ func (s *Stack) Save() error {
 				after[name] = spellings
 			}
 		}
-		if i != 0 && reflect.DeepEqual(before, after) {
-			continue // nothing new for this vault
+		changed := !reflect.DeepEqual(before, after)
+		if i == 0 && !reflect.DeepEqual(unreviewed, s.savedU) {
+			changed = true
+		}
+		if !changed {
+			continue
 		}
 		v.variants = transform.NewVariants(after)
-		if err := v.Save(s.paths[i]); err != nil {
+		plain, err := v.encode()
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, &Job{i: i, path: s.paths[i], pass: v.passphrase, plain: plain, enc: v.Encrypted,
+			run: func(j *Job) error { return writeVault(j.path, j.plain, j.enc, j.pass) }})
+	}
+	return jobs, nil
+}
+
+// ErrChangedOnDisk means a vault was modified elsewhere since it was loaded.
+var ErrChangedOnDisk = errors.New("vault changed on disk; reload before saving")
+
+// FinishSave records which files were written. savedU/savedV describe what
+// SaveJobs captured, not entries recorded while the jobs ran, so those are
+// still saved next time.
+func (s *Stack) FinishSave(jobs []*Job, capturedU map[string]string, capturedV map[string]map[int]string) error {
+	var errs []error
+	for _, j := range jobs {
+		if j.err != nil {
+			errs = append(errs, j.err)
+			continue
+		}
+		s.mtimes[j.i] = j.mtime
+	}
+	if len(errs) == 0 {
+		s.savedU, s.savedV = capturedU, capturedV
+	}
+	return errors.Join(errs...)
+}
+
+// Capture returns what SaveJobs is about to write, for FinishSave.
+func (s *Stack) Capture() (map[string]string, map[string]map[int]string) {
+	return s.Primary().unreviewed.Entries(), s.variants.Entries()
+}
+
+// Save writes recorded variants and unreviewed entries (see SaveJobs),
+// reloading first if a vault changed on disk.
+func (s *Stack) Save() error {
+	if s.Changed() {
+		if err := s.Reload(); err != nil {
 			return err
 		}
-		s.mtimes[i] = mtime(s.paths[i])
 	}
-	s.snapshot()
-	return nil
+	u, v := s.Capture()
+	jobs, err := s.SaveJobs()
+	if err != nil {
+		return err
+	}
+	RunJobs(jobs)
+	return s.FinishSave(jobs, u, v)
 }

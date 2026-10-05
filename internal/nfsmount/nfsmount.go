@@ -63,7 +63,10 @@ func Start(fsys billy.Filesystem, mountpoint string) (*Server, error) {
 	opts := strings.Join([]string{
 		"port=" + port, "mountport=" + port, "vers=3", "tcp",
 		"nolocks", "locallocks", "noresvport", // no lockd/statd; unprivileged client port
-		"soft", "timeo=10", "retrans=2", // fail fast instead of hanging if we die
+		// Soft: fail rather than hang if we die (a dead server is noticed at
+		// once anyway: the connection is refused). 3 s per try leaves ample
+		// room for slow requests without "not responding" messages.
+		"soft", "timeo=30", "retrans=2",
 		"actimeo=1", // see target changes quickly
 		"nobrowse",  // keep it out of Finder's sidebar
 	}, ",")

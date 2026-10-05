@@ -93,6 +93,7 @@ func (e *env) fs() *FS {
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	e.t.Cleanup(func() { f.Close() })
 	return f
 }
 
@@ -322,9 +323,9 @@ func TestExternalChangesAndVaultEdits(t *testing.T) {
 	v.Save(e.vault)
 	future := time.Now().Add(2 * time.Second)
 	os.Chtimes(e.vault, future, future)
-	f.mu.Lock()
-	f.lastCheck = time.Time{}
-	f.mu.Unlock()
+	if err := f.Refresh(); err != nil {
+		t.Fatal(err)
+	}
 	if g := readFile(t, f, id+"/a.md"); g != "{{pi.lastname}} {{pi.word}}\n" {
 		t.Fatalf("after vault edit: %q", g)
 	}
@@ -374,6 +375,7 @@ func TestReopenAfterUnlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { f.Close() })
 	// Simulate guises whose vault was locked at startup.
 	f.mu.Lock()
 	for _, g := range f.guises {
@@ -415,5 +417,55 @@ func TestHealLinks(t *testing.T) {
 	}
 	if again, _ := f.HealLinks("/mnt"); len(again) != 0 {
 		t.Fatalf("healed twice: %v", again)
+	}
+}
+
+// Decrypting a vault takes about a second by design (scrypt). Requests must
+// not wait for it, or NFS clients report "server not responding".
+func TestStaysResponsiveDuringVaultReload(t *testing.T) {
+	e := newEnv(t, nil)
+	pass := func() ([]byte, error) { return []byte("pw"), nil }
+	encPath := filepath.Join(e.root, "enc.age")
+	v, err := vault.Create(encPath, true, pass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.Set("lastname", "Wiltzius")
+	v.Save(encPath)
+	e.vault = encPath
+	target := e.write("docs/a.md", "Wiltzius\n")
+	id := e.add(target, registry.KindFile, registry.ModeHide, rules.Config{})
+	f, err := New(Options{ConfigDir: e.config, ScratchDir: e.scratch, Logf: t.Logf,
+		PassFor: func(string) vault.PassphraseFunc { return pass }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+
+	v.Set("city", "Austin") // an edit made elsewhere, e.g. `guise vault set`
+	v.Save(encPath)
+	future := time.Now().Add(2 * time.Second)
+	os.Chtimes(encPath, future, future)
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() { f.Refresh(); close(done) }()
+	var worst time.Duration
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+			t0 := time.Now()
+			if _, err := f.Lstat(id + "/a.md"); err != nil {
+				t.Fatal(err)
+			}
+			worst = max(worst, time.Since(t0))
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	t.Logf("reload took %v; slowest request %v", time.Since(start), worst)
+	if worst > 200*time.Millisecond {
+		t.Fatalf("a request waited %v during the reload", worst)
 	}
 }

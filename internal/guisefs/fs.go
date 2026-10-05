@@ -56,14 +56,23 @@ type Options struct {
 type FS struct {
 	opt Options
 
+	// mu guards everything below. Nothing slow (vault decryption or
+	// encryption) ever runs while it is held: NFS clients time out and log
+	// "server not responding" if a request waits too long.
 	mu         sync.Mutex
 	regMod     time.Time
-	lastCheck  time.Time
 	guises     map[string]*guiseState // by ID
 	stacks     map[string]*vault.Stack
 	cache      map[string]*content // by real path
 	tombstones map[string]bool     // real paths hidden from the guise
+	dirty      map[*vault.Stack]bool
+	busy       map[*vault.Stack]bool // a save is writing this stack's files
 	saveTimer  *time.Timer
+
+	refreshMu sync.Mutex // serializes refreshes
+	stop      chan struct{}
+	stopped   chan struct{} // closed when loop exits
+	stopOnce  sync.Once
 }
 
 type guiseState struct {
@@ -74,7 +83,8 @@ type guiseState struct {
 	gen     uint64
 }
 
-// New returns an FS. It loads the registry and opens vaults immediately.
+// New returns an FS. It loads the registry and opens vaults immediately,
+// then keeps them current in the background until Close.
 func New(opt Options) (*FS, error) {
 	if opt.Logf == nil {
 		opt.Logf = func(string, ...any) {}
@@ -94,70 +104,169 @@ func New(opt Options) (*FS, error) {
 		stacks:     map[string]*vault.Stack{},
 		cache:      map[string]*content{},
 		tombstones: map[string]bool{},
+		dirty:      map[*vault.Stack]bool{},
+		busy:       map[*vault.Stack]bool{},
+		stop:       make(chan struct{}),
+		stopped:    make(chan struct{}),
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f, f.refreshLocked(true)
+	if err := f.refresh(true, false); err != nil {
+		return nil, err
+	}
+	go f.loop()
+	return f, nil
 }
 
-// refresh reloads the registry, vaults, and project config if they changed.
-// It checks at most once a second unless forced.
-func (f *FS) refreshLocked(force bool) error {
-	if !force && time.Since(f.lastCheck) < time.Second {
-		return nil
+// loop refreshes once a second.
+func (f *FS) loop() {
+	defer close(f.stopped)
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-f.stop:
+			return
+		case <-t.C:
+			if err := f.refresh(false, false); err != nil {
+				f.opt.Logf("refresh: %v", err)
+			}
+		}
 	}
-	f.lastCheck = time.Now()
-	regPath := filepath.Join(f.opt.ConfigDir, registry.File)
+}
+
+// Refresh picks up registry, vault, and project-config changes now.
+func (f *FS) Refresh() error { return f.refresh(true, false) }
+
+// Reopen re-reads the registry now and retries guises whose vaults could
+// not be opened before (e.g. after a passphrase was supplied).
+func (f *FS) Reopen() error { return f.refresh(true, true) }
+
+// refresh reloads the registry, vaults, and project config if they changed.
+// Slow work happens without f.mu; results are swapped in under it.
+func (f *FS) refresh(force, retry bool) error {
+	f.refreshMu.Lock()
+	defer f.refreshMu.Unlock()
+
+	// 1. Registry: open stacks for new or changed guises.
 	var mod time.Time
-	if fi, err := os.Stat(regPath); err == nil {
+	if fi, err := os.Stat(filepath.Join(f.opt.ConfigDir, registry.File)); err == nil {
 		mod = fi.ModTime()
 	}
-	if force || !mod.Equal(f.regMod) {
+	f.mu.Lock()
+	regChanged := force || !mod.Equal(f.regMod)
+	f.mu.Unlock()
+	if regChanged {
 		reg, err := registry.Load(f.opt.ConfigDir)
 		if err != nil {
 			return err
 		}
-		f.regMod = mod
+		f.mu.Lock()
+		need := map[string][]string{} // stack key → vault paths
+		for _, rec := range reg.Guises {
+			old, ok := f.guises[rec.ID]
+			reuse := ok && sameRecord(old.rec, rec) && (old.stack != nil || !retry)
+			if _, open := f.stacks[stackKey(rec)]; !reuse && !open {
+				need[stackKey(rec)] = rec.Vaults
+			}
+		}
+		f.mu.Unlock()
+
+		opened := map[string]*vault.Stack{}
+		failed := map[string]error{}
+		for key, paths := range need {
+			st, err := vault.OpenStack(paths, f.opt.PassFor)
+			if err != nil {
+				failed[key] = err
+				continue
+			}
+			opened[key] = st
+		}
+		projects := map[string]rules.Config{}
+		for _, rec := range reg.Guises {
+			p, _, err := rules.FindProject(filepath.Dir(rec.Target))
+			if err != nil {
+				f.opt.Logf("guise %s: %v", rec.ID, err)
+			}
+			projects[rec.ID] = p
+		}
+
+		f.mu.Lock()
+		for key, st := range opened {
+			if _, exists := f.stacks[key]; !exists {
+				f.stacks[key] = st
+				for _, name := range st.Collisions() {
+					f.opt.Logf("vaults %s: %q is defined in more than one vault; the first wins", key, name)
+				}
+			}
+		}
 		next := map[string]*guiseState{}
 		for _, rec := range reg.Guises {
-			if old, ok := f.guises[rec.ID]; ok && sameRecord(old.rec, rec) {
+			if old, ok := f.guises[rec.ID]; ok && sameRecord(old.rec, rec) && (old.stack != nil || !retry) {
 				next[rec.ID] = old
 				continue
 			}
-			next[rec.ID] = f.openGuise(rec)
+			g := &guiseState{rec: rec, engines: map[string]*transform.Engine{}, project: projects[rec.ID]}
+			g.stack = f.stacks[stackKey(rec)]
+			if g.stack == nil {
+				f.opt.Logf("guise %s unavailable: %v", rec.ID, failed[stackKey(rec)])
+			}
+			next[rec.ID] = g
 		}
 		f.guises = next
+		f.regMod = mod
+		f.mu.Unlock()
 	}
-	for key, s := range f.stacks {
-		if s.Changed() {
-			if err := s.Reload(); err != nil {
-				f.opt.Logf("reload vaults %s: %v", key, err)
+
+	// 2. Vaults changed on disk (e.g. `guise vault set`).
+	f.mu.Lock()
+	type reload struct {
+		st   *vault.Stack
+		jobs []*vault.Job
+	}
+	var reloads []reload
+	for _, st := range f.stacks {
+		if !f.busy[st] {
+			if jobs := st.ReloadJobs(); len(jobs) > 0 {
+				reloads = append(reloads, reload{st, jobs})
 			}
 		}
 	}
+	f.mu.Unlock()
+	for _, r := range reloads {
+		vault.RunJobs(r.jobs)
+	}
+	f.mu.Lock()
+	for _, r := range reloads {
+		if err := r.st.ApplyReload(r.jobs); err != nil {
+			f.opt.Logf("reload vaults: %v", err)
+		}
+	}
+	f.mu.Unlock()
+
+	// 3. Project config.
+	f.mu.Lock()
+	targets := map[*guiseState]string{}
 	for _, g := range f.guises {
-		if p, _, err := rules.FindProject(filepath.Dir(g.rec.Target)); err == nil {
-			if !sameJSON(p, g.project) {
-				g.project = p
-				g.engines = map[string]*transform.Engine{}
-			}
+		targets[g] = filepath.Dir(g.rec.Target)
+	}
+	f.mu.Unlock()
+	projects := map[*guiseState]rules.Config{}
+	for g, dir := range targets {
+		if p, _, err := rules.FindProject(dir); err == nil {
+			projects[g] = p
 		}
 	}
+	f.mu.Lock()
+	for g, p := range projects {
+		if !sameJSON(p, g.project) {
+			g.project = p
+			g.engines = map[string]*transform.Engine{}
+		}
+	}
+	f.mu.Unlock()
 	return nil
 }
 
-// Reopen re-reads the registry now and retries guises whose vaults could
-// not be opened before (e.g. after a passphrase was supplied).
-func (f *FS) Reopen() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for id, g := range f.guises {
-		if g.stack == nil {
-			delete(f.guises, id)
-		}
-	}
-	return f.refreshLocked(true)
-}
+func stackKey(rec registry.Guise) string { return strings.Join(rec.Vaults, "\n") }
 
 // Unavailable returns the paths of guises that cannot be served because
 // their vaults could not be opened.
@@ -187,31 +296,6 @@ func sameJSON(a, b any) bool {
 	x, _ := json.Marshal(a)
 	y, _ := json.Marshal(b)
 	return bytes.Equal(x, y)
-}
-
-func (f *FS) openGuise(rec registry.Guise) *guiseState {
-	g := &guiseState{rec: rec, engines: map[string]*transform.Engine{}}
-	key := strings.Join(rec.Vaults, "\n")
-	s, ok := f.stacks[key]
-	if !ok {
-		var err error
-		s, err = vault.OpenStack(rec.Vaults, f.opt.PassFor)
-		if err != nil {
-			f.opt.Logf("guise %s unavailable: %v", rec.ID, err)
-			return g
-		}
-		for _, name := range s.Collisions() {
-			f.opt.Logf("guise %s: %q is defined in more than one vault; the first wins", rec.ID, name)
-		}
-		f.stacks[key] = s
-	}
-	g.stack = s
-	if p, _, err := rules.FindProject(filepath.Dir(rec.Target)); err == nil {
-		g.project = p
-	} else {
-		f.opt.Logf("guise %s: %v", rec.ID, err)
-	}
-	return g
 }
 
 // engine returns the engine for a path inside a guise.
@@ -248,6 +332,7 @@ func (f *FS) forward(g *guiseState, e *transform.Engine, s string) string {
 	if g.hide() {
 		out := e.Hide(s)
 		if g.stack.Dirty() {
+			f.dirty[g.stack] = true
 			f.scheduleSaveLocked()
 		}
 		return out
@@ -273,24 +358,61 @@ func (f *FS) scheduleSaveLocked() {
 	}
 	f.saveTimer = time.AfterFunc(f.opt.SaveDelay, func() {
 		f.mu.Lock()
-		defer f.mu.Unlock()
 		f.saveTimer = nil
-		f.saveStacksLocked()
+		f.mu.Unlock()
+		f.saveStacks()
 	})
 }
 
-func (f *FS) saveStacksLocked() {
-	for key, s := range f.stacks {
-		if err := s.Save(); err != nil {
-			f.opt.Logf("save vaults %s: %v", key, err)
+// saveStacks writes new variants and detections to the vaults, encrypting
+// without holding f.mu.
+func (f *FS) saveStacks() {
+	type save struct {
+		st   *vault.Stack
+		jobs []*vault.Job
+		u    map[string]string
+		v    map[string]map[int]string
+	}
+	f.mu.Lock()
+	var saves []save
+	for st := range f.dirty {
+		if f.busy[st] {
+			continue
 		}
+		u, v := st.Capture()
+		jobs, err := st.SaveJobs()
+		if errors.Is(err, vault.ErrChangedOnDisk) {
+			f.scheduleSaveLocked() // the refresher reloads it first
+			continue
+		}
+		delete(f.dirty, st)
+		if err != nil {
+			f.opt.Logf("save vaults: %v", err)
+			continue
+		}
+		f.busy[st] = true
+		saves = append(saves, save{st, jobs, u, v})
+	}
+	f.mu.Unlock()
+	for _, sv := range saves {
+		vault.RunJobs(sv.jobs)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, sv := range saves {
+		if err := sv.st.FinishSave(sv.jobs, sv.u, sv.v); err != nil {
+			f.opt.Logf("save vaults: %v", err)
+			f.dirty[sv.st] = true
+		}
+		delete(f.busy, sv.st)
 	}
 }
 
-// Close flushes pending writes and vault changes.
+// Close stops background work and flushes pending writes and vault changes.
 func (f *FS) Close() error {
+	f.stopOnce.Do(func() { close(f.stop) })
+	<-f.stopped
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	var first error
 	for real, c := range f.cache {
 		if err := f.flushLocked(real, c); err != nil && first == nil {
@@ -301,7 +423,11 @@ func (f *FS) Close() error {
 		f.saveTimer.Stop()
 		f.saveTimer = nil
 	}
-	f.saveStacksLocked()
+	f.mu.Unlock()
+	if err := f.refresh(false, false); err != nil && first == nil { // merge edits made elsewhere
+		first = err
+	}
+	f.saveStacks()
 	return first
 }
 
@@ -342,7 +468,6 @@ func isScratchName(name string) bool {
 func clean(p string) string { return path.Clean("/" + filepath.ToSlash(p)) }
 
 func (f *FS) resolveLocked(p string) (node, error) {
-	_ = f.refreshLocked(false)
 	p = clean(p)
 	if p == "/" {
 		return node{kind: nRoot}, nil
