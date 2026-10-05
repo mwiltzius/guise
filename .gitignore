@@ -1,0 +1,27 @@
+# Private notes, design docs, and plans
+CLAUDE.local.md
+Claude.local.md
+DESIGN*.md
+PLAN*.md
+*.plan.md
+/notes/
+/.claude/settings.local.json
+
+# Vaults and real data — never commit these
+*.age
+/.vault/
+/.pi/
+
+# Build output
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
